@@ -833,7 +833,8 @@ public class FileTransfer extends CordovaPlugin {
                 } finally {
                     safeClose(outputStream);
                     synchronized (activeRequests) {
-                        activeRequests.remove(objectId);
+                        if (!(context.paused || context.aborted))
+                            activeRequests.remove(objectId);
                     }
 
                     if (connection != null) {
