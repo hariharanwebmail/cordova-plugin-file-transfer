@@ -352,10 +352,43 @@ static CFIndex WriteDataToStream(NSData* data, CFWriteStreamRef stream)
 
     if (delegate != nil) {
         [delegate cancelTransfer:delegate.connection];
+        // delete uncomplete file
+        NSFileManager* fileMgr = [NSFileManager defaultManager];
+        [fileMgr removeItemAtPath:delegate.target error:nil];
+
         CDVPluginResult* result = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsDictionary:[self createFileTransferError:CONNECTION_ABORTED AndSource:delegate.source AndTarget:delegate.target]];
         [self.commandDelegate sendPluginResult:result callbackId:delegate.callbackId];
     }
 }
+
+- (void)pause:(CDVInvokedUrlCommand*)command
+{
+  NSString* objectId = [command.arguments objectAtIndex:0];
+  FileDownloaderDelegate* delegate = [activeTransfers objectForKey:objectId];
+  if (delegate != nil) {
+    [delegate.connection cancel];
+    [activeTransfers removeObjectForKey:objectId];
+    CDVPluginResult* result = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK  messageAsString:@"paused"];
+    [self.commandDelegate sendPluginResult:result callbackId:delegate.callbackId];
+  }
+}
+
+-(NSUInteger) checkDownloadedByte:(FileDownloaderDelegate *)delegate
+{
+  NSUInteger downloadedBytes = 0;
+  NSFileManager *fm = [NSFileManager defaultManager];
+  if ([fm fileExistsAtPath:delegate.target]) {
+    NSError *error = nil;
+    NSDictionary *fileDictionary = [fm attributesOfItemAtPath:delegate.target  error:&error];
+    if (!error && fileDictionary)
+    {
+      downloadedBytes = [fileDictionary fileSize];
+      return downloadedBytes;
+    }
+  }
+  return 0;
+}
+
 
 - (void)download:(CDVInvokedUrlCommand*)command
 {
@@ -400,7 +433,7 @@ static CFIndex WriteDataToStream(NSData* data, CFWriteStreamRef stream)
         return;
     }
 
-    NSMutableURLRequest* req = [NSMutableURLRequest requestWithURL:url];
+    NSMutableURLRequest* req = [NSMutableURLRequest requestWithURL:url cachePolicy:NSURLRequestUseProtocolCachePolicy  timeoutInterval:30.0];
     [self applyRequestHeaders:headers toRequest:req];
 
     CDVFileTransferDelegate* delegate = [[CDVFileTransferDelegate alloc] init];
@@ -411,6 +444,18 @@ static CFIndex WriteDataToStream(NSData* data, CFWriteStreamRef stream)
     delegate.source = source;
     delegate.target = target;
     delegate.trustAllHosts = trustAllHosts;
+
+    NSUInteger downloadedBytes = [self checkDownloadedByte:delegate];
+    if (downloadedBytes > 0) {
+    //creating range request based on section
+    //14.35 Range
+    //14.35.1 Byte Ranges
+    //ref . http://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html
+    
+     NSString *requestRange = [NSString stringWithFormat:@"bytes=%d-", downloadedBytes];
+      [req setValue:requestRange forHTTPHeaderField:@"Range"];
+    }
+
 
     delegate.connection = [NSURLConnection connectionWithRequest:req delegate:delegate];
 
@@ -547,6 +592,8 @@ static CFIndex WriteDataToStream(NSData* data, CFWriteStreamRef stream)
         if (self.targetFileHandle) {
             [self.targetFileHandle closeFile];
             self.targetFileHandle = nil;
+            self.bytesExpected =0;
+            self.bytesTransfered =0;
             DLog(@"File Transfer Download success");
 
             filePlugin = [[CDVFile alloc] init];
@@ -640,6 +687,50 @@ static CFIndex WriteDataToStream(NSData* data, CFWriteStreamRef stream)
         if (self.targetFileHandle == nil) {
             [self cancelTransferWithError:connection errorMessage:@"Could not open target file for writing"];
         }
+
+      //seek file to a position if already there
+        switch (self.responseCode ) {
+          case 206:  //case of partial content with Content-Range header
+          {
+            NSError *error = nil;
+            NSRegularExpression *regex = nil;
+            
+            // Check to see if the server returned a valid byte-range
+            regex = [NSRegularExpression regularExpressionWithPattern:@"bytes (\\d+)-\\d+/\\d+"
+                                                              options:NSRegularExpressionCaseInsensitive
+                                                                error:&error];
+            if (error) {
+              [self.targetFileHandle truncateFileAtOffset:0];
+              break;
+            }
+            
+            // If the regex didn't match the number of bytes, start the download from the beginning
+            NSTextCheckingResult *match = [regex firstMatchInString:range
+                                                            options:NSMatchingAnchored
+                                                              range:NSMakeRange(0, range.length)];
+            if (match.numberOfRanges < 2) {
+              [self.targetFileHandle truncateFileAtOffset:0];
+              break;
+            }
+            
+            // Extract the byte offset the server reported to us, and truncate our
+            // file if it is starting us at "0".  Otherwise, seek our file to the
+            // appropriate offset.
+            NSString *byteStr = [range substringWithRange:[match rangeAtIndex:1]];
+            NSInteger bytes = [byteStr integerValue];
+            if (bytes <= 0) {
+              [self.targetFileHandle truncateFileAtOffset:0];
+              break;
+            } else {
+              self.bytesTransfered = bytes;
+              self.bytesExpected+=bytes;
+              [self.targetFileHandle seekToFileOffset:bytes];
+            }
+            break;
+          }
+        }
+
+
         DLog(@"Streaming to file %@", filePath);
     }
 }
@@ -663,6 +754,7 @@ static CFIndex WriteDataToStream(NSData* data, CFWriteStreamRef stream)
     } else {
         [self.responseData appendData:data];
     }
+    [self.targetFileHandle synchronizeFile];
     [self updateProgress];
 }
 
